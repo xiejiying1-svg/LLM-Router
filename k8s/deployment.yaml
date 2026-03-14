@@ -1,0 +1,177 @@
+# LLM Router Kubernetes Deployment
+# Usage: kubectl apply -f k8s/
+
+---
+# ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llm-router-config
+  namespace: llm-routing
+data:
+  config.yaml: |
+    load_balancer: smart
+    cache_enabled: true
+    redis_url: redis://redis-service:6379
+    smart_routing: true
+    cost_optimization: true
+    multi_tenant: true
+    rate_limit: 1000
+    health_check_interval: 30
+    config_watch: false
+    
+    endpoints:
+      - name: openai-gpt4o
+        provider: openai
+        base_url: ${OPENAI_BASE_URL}
+        api_key: ${OPENAI_API_KEY}
+        model: gpt-4o
+        weight: 1
+        cost_per_1k_tokens: 0.005
+        capabilities: [reasoning, code, creative]
+        enabled: true
+      - name: anthropic-claude-3-sonnet
+        provider: anthropic
+        base_url: https://api.anthropic.com/v1
+        api_key: ${ANTHROPIC_API_KEY}
+        model: claude-3-sonnet-20240229
+        weight: 2
+        cost_per_1k_tokens: 0.003
+        capabilities: [reasoning, code, creative]
+        enabled: true
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-router
+  namespace: llm-routing
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: llm-router
+  template:
+    metadata:
+      labels:
+        app: llm-router
+    spec:
+      containers:
+        - name: router
+          image: llm-router:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-router-secrets
+                  key: openai-api-key
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-router-secrets
+                  key: anthropic-api-key
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+      volumes:
+        - name: config
+          configMap:
+            name: llm-router-config
+
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-router-service
+  namespace: llm-routing
+spec:
+  selector:
+    app: llm-router
+  ports:
+    - port: 80
+      targetPort: 8000
+      name: http
+  type: ClusterIP
+
+---
+# HPA
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: llm-router-hpa
+  namespace: llm-routing
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: llm-router
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+---
+# Ingress
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm-router-ingress
+  namespace: llm-routing
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rpm: "1000"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+spec:
+  rules:
+    - host: llm-router.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: llm-router-service
+                port:
+                  number: 80
+
+---
+# Secret (create separately with your keys)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llm-router-secrets
+  namespace: llm-routing
+type: Opaque
+stringData:
+  openai-api-key: "your-openai-key-here"
+  anthropic-api-key: "your-anthropic-key-here"

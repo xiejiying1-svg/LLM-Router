@@ -81,6 +81,226 @@ class CacheStrategy(str, Enum):
     SEMANTIC = "semantic"
 
 
+class CircuitState(str, Enum):
+    CLOSED = "closed"      # Normal operation
+    OPEN = "open"          # Failing, reject requests
+    HALF_OPEN = "half_open"  # Testing if recovery
+
+
+# ============== Circuit Breaker ==============
+class CircuitBreaker:
+    """Circuit breaker to prevent cascading failures"""
+    
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: int = 60, half_open_max_calls: int = 3):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.half_open_max_calls = half_open_max_calls
+        self.failure_count = 0
+        self.success_count = 0
+        self.last_failure_time = None
+        self.state = CircuitState.CLOSED
+        self.half_open_calls = 0
+    
+    def record_success(self):
+        """Record a successful call"""
+        self.failure_count = 0
+        self.success_count += 1
+        if self.state == CircuitState.HALF_OPEN:
+            if self.success_count >= self.half_open_max_calls:
+                self.state = CircuitState.CLOSED
+                self.success_count = 0
+                self.half_open_calls = 0
+    
+    def record_failure(self):
+        """Record a failed call"""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.state == CircuitState.HALF_OPEN:
+            self.state = CircuitState.OPEN
+            self.half_open_calls = 0
+        elif self.failure_count >= self.failure_threshold:
+            self.state = CircuitState.OPEN
+    
+    def can_execute(self) -> bool:
+        """Check if a request can be executed"""
+        if self.state == CircuitState.CLOSED:
+            return True
+        elif self.state == CircuitState.OPEN:
+            if self.last_failure_time and (time.time() - self.last_failure_time) > self.recovery_timeout:
+                self.state = CircuitState.HALF_OPEN
+                self.half_open_calls = 0
+                return True
+            return False
+        elif self.state == CircuitState.HALF_OPEN:
+            if self.half_open_calls < self.half_open_max_calls:
+                self.half_open_calls += 1
+                return True
+            return False
+        return False
+    
+    def get_state(self) -> dict:
+        return {
+            "state": self.state.value,
+            "failure_count": self.failure_count,
+            "success_count": self.success_count,
+            "last_failure_time": self.last_failure_time
+        }
+
+
+# ============== Retry History ==============
+class RetryHistory:
+    """Track retry history for each endpoint"""
+    
+    def __init__(self, max_history: int = 1000):
+        self.max_history = max_history
+        self.history: list[dict] = []
+        self.lock = threading.Lock()
+    
+    def add_retry(self, endpoint: str, attempt: int, error: str, success: bool, latency: float):
+        """Record a retry attempt"""
+        with self.lock:
+            record = {
+                "timestamp": time.time(),
+                "endpoint": endpoint,
+                "attempt": attempt,
+                "error": error,
+                "success": success,
+                "latency": latency
+            }
+            self.history.append(record)
+            if len(self.history) > self.max_history:
+                self.history = self.history[-self.max_history:]
+    
+    def get_history(self, endpoint: str = None, limit: int = 100) -> list[dict]:
+        """Get retry history"""
+        with self.lock:
+            if endpoint:
+                filtered = [r for r in self.history if r["endpoint"] == endpoint]
+            else:
+                filtered = self.history
+            return filtered[-limit:]
+    
+    def get_stats(self, endpoint: str = None) -> dict:
+        """Get retry statistics"""
+        with self.lock:
+            if endpoint:
+                filtered = [r for r in self.history if r["endpoint"] == endpoint]
+            else:
+                filtered = self.history
+            
+            if not filtered:
+                return {"total": 0, "success_rate": 0, "avg_latency": 0}
+            
+            success_count = sum(1 for r in filtered if r["success"])
+            return {
+                "total": len(filtered),
+                "success": success_count,
+                "failed": len(filtered) - success_count,
+                "success_rate": success_count / len(filtered),
+                "avg_latency": sum(r["latency"] for r in filtered) / len(filtered)
+            }
+
+
+# ============== Audit Log ==============
+class AuditLogger:
+    """Detailed audit logging for all requests"""
+    
+    def __init__(self, max_entries: int = 10000):
+        self.max_entries = max_entries
+        self.entries: list[dict] = []
+        self.lock = threading.Lock()
+    
+    def log(self, request_id: str, client_id: str, endpoint: str, model: str, 
+            tokens_in: int, tokens_out: int, latency: float, status: str, 
+            error: str = None, cost: float = 0):
+        """Log a request"""
+        with self.lock:
+            entry = {
+                "timestamp": time.time(),
+                "request_id": request_id,
+                "client_id": client_id,
+                "endpoint": endpoint,
+                "model": model,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "latency": latency,
+                "status": status,
+                "error": error,
+                "cost": cost
+            }
+            self.entries.append(entry)
+            if len(self.entries) > self.max_entries:
+                self.entries = self.entries[-self.max_entries:]
+    
+    def get_logs(self, client_id: str = None, limit: int = 100) -> list[dict]:
+        """Get audit logs"""
+        with self.lock:
+            if client_id:
+                filtered = [e for e in self.entries if e["client_id"] == client_id]
+            else:
+                filtered = self.entries
+            return filtered[-limit:]
+    
+    def get_stats(self) -> dict:
+        """Get audit statistics"""
+        with self.lock:
+            if not self.entries:
+                return {"total_requests": 0, "success_rate": 0, "total_cost": 0}
+            
+            success = sum(1 for e in self.entries if e["status"] == "success")
+            total_cost = sum(e["cost"] for e in self.entries)
+            total_tokens = sum(e["tokens_out"] for e in self.entries)
+            
+            return {
+                "total_requests": len(self.entries),
+                "success": success,
+                "failed": len(self.entries) - success,
+                "success_rate": success / len(self.entries),
+                "total_cost": total_cost,
+                "total_tokens": total_tokens,
+                "avg_latency": sum(e["latency"] for e in self.entries) / len(self.entries)
+            }
+
+
+# ============== Request Priority ==============
+class PriorityLevel(str, Enum):
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class PriorityQueue:
+    """Priority queue for request handling"""
+    
+    def __init__(self):
+        self.queues = {
+            PriorityLevel.CRITICAL: [],
+            PriorityLevel.HIGH: [],
+            PriorityLevel.NORMAL: [],
+            PriorityLevel.LOW: []
+        }
+        self.lock = threading.Lock()
+    
+    def enqueue(self, priority: PriorityLevel, item):
+        """Add item to queue"""
+        with self.lock:
+            self.queues[priority].append(item)
+    
+    def dequeue(self):
+        """Get highest priority item"""
+        with self.lock:
+            for level in [PriorityLevel.CRITICAL, PriorityLevel.HIGH, PriorityLevel.NORMAL, PriorityLevel.LOW]:
+                if self.queues[level]:
+                    return self.queues[level].pop(0)
+            return None
+    
+    def size(self) -> int:
+        """Get total queue size"""
+        with self.lock:
+            return sum(len(q) for q in self.queues.values())
+
+
 # ============== Data Models ==============
 class EndpointConfig(BaseModel):
     """Configuration for a single LLM endpoint"""
