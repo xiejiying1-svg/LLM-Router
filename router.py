@@ -60,6 +60,17 @@ class ModelProvider(str, Enum):
     ANTHROPIC = "anthropic"
     GEMINI = "gemini"
     MINIMAX = "minimax"
+    MISTRAL = "mistral"
+    META = "meta"
+    XAI = "xai"
+    COHERE = "cohere"
+    DEEPSEEK = "deepseek"
+    BAIDU = "baidu"
+    ALIBABA = "alibaba"
+    BYTEDANCE = "bytedance"
+    ZHIPU = "zhipu"
+    TENCENT = "tencent"
+    SILICONFLOW = "siliconflow"
     CUSTOM = "custom"
 
 
