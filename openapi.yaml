@@ -1,0 +1,270 @@
+openapi: 3.0.0
+info:
+  title: LLM Router API
+  description: |
+    Multi-Provider LLM Routing API with Load Balancing, Retry, and Rate Limiting
+    
+    ## Features
+    - **Load Balancing**: Round Robin, Random, Least Connections, Weighted
+    - **Retry Mechanism**: Automatic failover to next endpoint on failure
+    - **Rate Limiting**: Per-client request rate limiting
+    - **Multi-Provider**: OpenAI, Anthropic Claude, Google Gemini support
+    - **Streaming**: Server-Sent Events for real-time responses
+    - **WebSocket**: Persistent connections for chat
+    - **API Keys**: Manage client API keys with rate limits
+    - **Monitoring**: Health checks, statistics, and request logs
+  version: 1.0.0
+  contact:
+    name: LLM Router Team
+
+servers:
+  - url: http://localhost:8000
+    description: Local development server
+
+paths:
+  /:
+    get:
+      summary: Root endpoint
+      description: Returns basic information about the API
+      responses:
+        '200':
+          description: API information
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    example: LLM Router
+                  version:
+                    type: string
+                    example: 1.0.0
+                  docs:
+                    type: string
+                    example: /docs
+
+  /health:
+    get:
+      summary: Health check
+      description: Returns health status of all endpoints
+      responses:
+        '200':
+          description: Health status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  endpoints:
+                    type: object
+                    additionalProperties:
+                      type: boolean
+                  total_endpoints:
+                    type: integer
+                  healthy_endpoints:
+                    type: integer
+
+  /stats:
+    get:
+      summary: Get statistics
+      description: Returns router statistics including request counts and success rates
+      responses:
+        '200':
+          description: Statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_requests:
+                    type: integer
+                  successful:
+                    type: integer
+                  failed:
+                    type: integer
+                  success_rate:
+                    type: number
+                  average_duration:
+                    type: number
+                  endpoints:
+                    type: object
+
+  /logs:
+    get:
+      summary: Get request logs
+      description: Returns recent request logs
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+      responses:
+        '200':
+          description: Request logs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+
+  /keys:
+    post:
+      summary: Create API key
+      description: Creates a new API key for client authentication
+      parameters:
+        - name: rate_limit
+          in: query
+          schema:
+            type: integer
+            description: Requests per minute limit
+      responses:
+        '200':
+          description: Created API key
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_key:
+                    type: string
+                  key_hash:
+                    type: string
+
+  /chat/completions:
+    post:
+      summary: Chat completions
+      description: |
+        Send a chat completion request to the router.
+        
+        Supports streaming via Server-Sent Events.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - messages
+              properties:
+                model:
+                  type: string
+                  description: Model to use (optional, uses load balancer if not specified)
+                messages:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      role:
+                        type: string
+                        enum: [system, user, assistant]
+                      content:
+                        type: string
+                temperature:
+                  type: number
+                  default: 0.7
+                  minimum: 0
+                  maximum: 2
+                max_tokens:
+                  type: integer
+                  minimum: 1
+                stream:
+                  type: boolean
+                  default: false
+                user:
+                  type: string
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Chat completion response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatResponse'
+        '400':
+          description: Bad request
+        '429':
+          description: Rate limit exceeded
+        '502':
+          description: All endpoints failed
+
+  /v1/chat/completions:
+    post:
+      summary: OpenAI-compatible chat completions
+      description: OpenAI API compatible endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Chat completion response
+
+  /ws/chat:
+    get:
+      summary: WebSocket chat
+      description: Persistent WebSocket connection for chat
+      responses:
+        '101':
+          description: WebSocket upgrade successful
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+
+  schemas:
+    ChatMessage:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant]
+        content:
+          type: string
+
+    ChatRequest:
+      type: object
+      required:
+        - messages
+      properties:
+        model:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        temperature:
+          type: number
+          default: 0.7
+        max_tokens:
+          type: integer
+        stream:
+          type: boolean
+          default: false
+        user:
+          type: string
+
+    ChatResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+        usage:
+          type: object

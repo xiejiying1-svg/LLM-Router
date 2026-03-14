@@ -1,67 +1,34 @@
-# LLM Router - 智能大模型路由网关
+# LLM Router 🧭
 
-English | [中文](./README_CN.md)
+Multi-Provider LLM Routing with Load Balancing, Retry, Rate Limiting & Monitoring
 
-A powerful LLM gateway that aggregates multiple LLM providers with intelligent routing, automatic failover, monitoring and alerting.
+[English](./README.md) | [中文](./README_CN.md)
 
 ## Features
 
-- 🔄 **Intelligent Routing** - Automatically selects the best provider based on response time, price, and quality
-- 🛡️ **Automatic Failover** - Automatically switches to backup provider when one fails
-- 📊 **Real-time Monitoring** - Track API usage, costs, latency and success rates
-- 🔔 **Smart Alerting** - Notify when issues occur or quotas are low
-- 💰 **Cost Optimization** - Route requests to the most cost-effective provider
-- 🌐 **Unified API** - Single endpoint for multiple LLM providers
-
-## Supported Providers
-
-| Provider | Status |
-|----------|--------|
-| OpenAI | ✅ |
-| Anthropic (Claude) | ✅ |
-| Google (Gemini) | ✅ |
-| DeepSeek | ✅ |
-| Moonshot (Kimi) | ✅ |
-| Zhipu (GLM) | ✅ |
-| SiliconFlow | ✅ |
-| OpenRouter | ✅ |
+- 🔄 **Load Balancing**: Round Robin, Random, Least Connections, Weighted
+- 🔁 **Retry & Failover**: Automatic retry with exponential backoff
+- 🚀 **Multi-Provider**: OpenAI, Anthropic Claude, Google Gemini
+- 📊 **Rate Limiting**: Per-client and global rate limiting
+- 🔌 **Streaming**: Server-Sent Events support
+- 🔌 **WebSocket**: Persistent connections for chat
+- 🔐 **API Keys**: Manage client authentication
+- 📈 **Monitoring**: Health checks, stats, request logs
+- 🐳 **Docker**: Ready for production deployment
 
 ## Quick Start
 
 ### Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/LLM-Router.git
-cd LLM-Router
 pip install -r requirements.txt
 ```
 
 ### Configuration
 
-Copy `config.example.yaml` to `config.yaml` and add your API keys:
-
-```yaml
-providers:
-  openai:
-    api_key: your-openai-key
-    base_url: https://api.openai.com/v1
-    
-  anthropic:
-    api_key: your-anthropic-key
-    
-  deepseek:
-    api_key: your-deepseek-key
-
-routing:
-  default_model: gpt-4o-mini
-  fallback_models:
-    - gpt-4o-mini
-    - claude-3-haiku
-    - deepseek-chat
-
-monitoring:
-  enabled: true
-  log_file: router.log
+```bash
+cp config.example.yaml config.yaml
+# Edit config.yaml with your endpoints
 ```
 
 ### Run
@@ -70,57 +37,104 @@ monitoring:
 python main.py
 ```
 
-### Use via API
+Server runs at `http://localhost:8000`
+
+## Configuration
+
+```yaml
+load_balancer: round_robin
+default_timeout: 60
+max_retries: 3
+retry_delay: 1.0
+rate_limit: 100
+
+endpoints:
+  - name: openai-gpt4
+    provider: openai
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}
+    model: gpt-4
+    weight: 1
+    timeout: 60
+    max_retries: 3
+    enabled: true
+
+  - name: anthropic-claude
+    provider: anthropic
+    base_url: https://api.anthropic.com/v1
+    api_key: ${ANTHROPIC_API_KEY}
+    model: claude-3-opus-20240229
+    weight: 1
+    timeout: 60
+    max_retries: 3
+    enabled: true
+```
+
+## API Usage
+
+### Chat Completions
 
 ```bash
-curl -X POST http://localhost:8000/v1/chat/completions \
+curl -X POST http://localhost:8000/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "temperature": 0.7
+  }'
+```
+
+### Streaming
+
+```bash
+curl -X POST http://localhost:8000/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4o-mini",
-    "messages": [{"role": "user", "content": "Hello!"}]
+    "messages": [{"role": "user", "content": "Count to 5"}],
+    "stream": true
   }'
+```
+
+### WebSocket
+
+```javascript
+const ws = new WebSocket('ws://localhost:8000/ws/chat');
+ws.send(JSON.stringify({messages: [{role: 'user', content: 'Hello'}]}));
 ```
 
 ## API Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v1/chat/completions` | POST | Chat completion |
-| `/v1/models` | GET | List available models |
-| `/health` | GET | Health check |
-| `/stats` | GET | Usage statistics |
+| Endpoint | Description |
+|----------|-------------|
+| `GET /` | Root info |
+| `GET /health` | Health check |
+| `GET /stats` | Statistics |
+| `GET /logs` | Request logs |
+| `POST /keys` | Create API key |
+| `POST /chat/completions` | Chat API |
+| `POST /v1/chat/completions` | OpenAI-compatible |
+| `WS /ws/chat` | WebSocket chat |
 
-## Architecture
+## Docker
 
-```
-┌─────────────┐
-│   Client    │
-└──────┬──────┘
-       │
-┌──────▼──────┐
-│  Router     │  ← Intelligent routing logic
-└──────┬──────┘
-       │
-┌──────▼──────┐
-│  Providers  │  ← OpenAI, Claude, Gemini...
-└─────────────┘
-       │
-┌──────▼──────┐
-│  Monitor    │  ← Logging & alerting
-└─────────────┘
+```bash
+docker build -t llm-router .
+docker run -p 8000:8000 -v config.yaml:/app/config.yaml llm-router
 ```
 
-## Use Cases
+Or use docker-compose:
 
-- **Cost Optimization** - Route to cheaper providers during high traffic
-- **Reliability** - Automatic failover ensures 99.9% uptime
-- **Development** - Easy switching between providers during development
-- **Research** - Compare responses across different models
+```bash
+docker-compose up -d
+```
+
+## Documentation
+
+- [API Docs](http://localhost:8000/docs) - Swagger UI
+- [Deployment Guide](./DEPLOYMENT.md)
+- [FAQ](./FAQ.md)
+- [Benchmark](./BENCHMARK.md)
 
 ## License
 
-MIT License
-
----
-
-Made with ❤️ for the AI Community
+MIT
