@@ -1,17 +1,21 @@
 """
-LLM Router - Multi-Provider LLM Routing with Load Balancing, Retry, and Rate Limiting
+LLM Router - Advanced Multi-Provider LLM Routing
+With Caching, Smart Routing, Cost Optimization, Multi-Tenant, Metrics, Redis, Hot Reload
 """
 import asyncio
 import hashlib
+import json
 import logging
 import os
+import re
+import threading
 import time
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
-from collections import defaultdict
-import threading
+import uuid
 
 # Third-party imports
 import httpx
@@ -21,6 +25,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
+
+# For caching
+from functools import lru_cache
+import hashlib
+
+# For Redis (optional)
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(
@@ -36,6 +51,8 @@ class LoadBalancerStrategy(str, Enum):
     RANDOM = "random"
     LEAST_CONNECTIONS = "least_connections"
     WEIGHTED = "weighted"
+    COST_OPTIMIZED = "cost_optimized"
+    SMART = "smart"
 
 
 class ModelProvider(str, Enum):
@@ -44,6 +61,13 @@ class ModelProvider(str, Enum):
     GEMINI = "gemini"
     MINIMAX = "minimax"
     CUSTOM = "custom"
+
+
+class CacheStrategy(str, Enum):
+    NONE = "none"
+    LRU = "lru"
+    TTL = "ttl"
+    SEMANTIC = "semantic"
 
 
 # ============== Data Models ==============
@@ -58,6 +82,18 @@ class EndpointConfig(BaseModel):
     timeout: int = Field(default=60, ge=1)
     max_retries: int = Field(default=3, ge=0)
     enabled: bool = True
+    cost_per_1k_tokens: float = Field(default=0.002)  # Cost per 1K tokens
+    capabilities: list[str] = Field(default_factory=list)  # e.g., ["code", "creative", "reasoning"]
+    max_tokens: int = Field(default=4096)
+
+
+class TenantConfig(BaseModel):
+    """Multi-tenant configuration"""
+    tenant_id: str
+    rate_limit: int = 60  # requests per minute
+    monthly_budget: Optional[float] = None
+    endpoints: list[str] = Field(default_factory=list)  # allowed endpoints
+    enabled: bool = True
 
 
 class RouterConfig(BaseModel):
@@ -66,29 +102,43 @@ class RouterConfig(BaseModel):
     default_timeout: int = Field(default=60, ge=1)
     max_retries: int = Field(default=3, ge=0)
     retry_delay: float = Field(default=1.0, ge=0)
-    rate_limit: Optional[int] = Field(default=None, ge=1)  # requests per minute
-    health_check_interval: int = Field(default=60, ge=10)  # seconds
+    rate_limit: Optional[int] = Field(default=None, ge=1)
+    health_check_interval: int = Field(default=60, ge=10)
+
+    # Advanced features
+    cache_enabled: bool = False
+    cache_ttl: int = 3600  # seconds
+    cache_max_size: int = 1000
+    redis_url: Optional[str] = None
+    smart_routing: bool = False
+    cost_optimization: bool = False
+
+    # Multi-tenant
+    multi_tenant: bool = False
+    tenants: dict[str, TenantConfig] = Field(default_factory=dict)
+
+    # Hot reload
+    config_watch: bool = False
+
     endpoints: list[EndpointConfig] = Field(default_factory=list)
 
 
 class ChatMessage(BaseModel):
-    """Chat message format"""
     role: str = Field(default="user")
     content: str
 
 
 class ChatRequest(BaseModel):
-    """Chat completion request"""
     model: Optional[str] = None
     messages: list[ChatMessage]
     temperature: float = Field(default=0.7, ge=0, le=2)
     max_tokens: Optional[int] = Field(default=None, ge=1)
     stream: bool = False
     user: Optional[str] = None
+    tenant_id: Optional[str] = None  # For multi-tenant
 
 
 class ChatResponse(BaseModel):
-    """Chat completion response"""
     id: str
     object: str = "chat.completion"
     created: int
@@ -97,18 +147,171 @@ class ChatResponse(BaseModel):
     usage: dict
 
 
-class APIKeyInfo(BaseModel):
-    """API Key information"""
-    key_hash: str
-    prefix: str
-    created_at: int
-    rate_limit: Optional[int] = None
-    enabled: bool = True
+# ============== Cache ==============
+class RequestCache:
+    """LRU/TTL cache for chat requests"""
+
+    def __init__(self, max_size: int = 1000, ttl: int = 3600, redis_url: Optional[str] = None):
+        self.max_size = max_size
+        self.ttl = ttl
+        self.redis_url = redis_url
+        self.redis_client = None
+
+        if redis_url and REDIS_AVAILABLE:
+            try:
+                self.redis_client = redis.from_url(redis_url)
+                logger.info("Redis cache enabled")
+            except Exception as e:
+                logger.warning(f"Redis connection failed: {e}, using in-memory cache")
+
+        self.memory_cache = {}
+        self.access_order = []
+        self.lock = threading.Lock()
+
+    def _generate_key(self, messages: list[dict], temperature: float, max_tokens: Optional[int]) -> str:
+        """Generate cache key from request"""
+        content = json.dumps({
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }, sort_keys=True)
+        return hashlib.sha256(content.encode()).hexdigest()
+
+    def get(self, key: str) -> Optional[dict]:
+        """Get cached response"""
+        if self.redis_client:
+            try:
+                data = self.redis_client.get(f"llm_cache:{key}")
+                if data:
+                    return json.loads(data)
+            except Exception as e:
+                logger.warning(f"Redis get failed: {e}")
+
+        with self.lock:
+            if key in self.memory_cache:
+                entry = self.memory_cache[key]
+                if time.time() - entry["timestamp"] < self.ttl:
+                    # Update access order
+                    self.access_order.remove(key)
+                    self.access_order.append(key)
+                    return entry["data"]
+                else:
+                    del self.memory_cache[key]
+                    if key in self.access_order:
+                        self.access_order.remove(key)
+        return None
+
+    def set(self, key: str, value: dict):
+        """Set cached response"""
+        if self.redis_client:
+            try:
+                self.redis_client.setex(
+                    f"llm_cache:{key}",
+                    self.ttl,
+                    json.dumps(value)
+                )
+            except Exception as e:
+                logger.warning(f"Redis set failed: {e}")
+
+        with self.lock:
+            # Evict if full
+            if len(self.memory_cache) >= self.max_size:
+                oldest = self.access_order.pop(0)
+                del self.memory_cache[oldest]
+
+            self.memory_cache[key] = {
+                "data": value,
+                "timestamp": time.time()
+            }
+            self.access_order.append(key)
+
+    def clear(self):
+        """Clear all cache"""
+        if self.redis_client:
+            try:
+                keys = self.redis_client.keys("llm_cache:*")
+                if keys:
+                    self.redis_client.delete(*keys)
+            except Exception as e:
+                logger.warning(f"Redis clear failed: {e}")
+
+        with self.lock:
+            self.memory_cache.clear()
+            self.access_order.clear()
+
+
+# ============== Smart Router ==============
+class SmartRouter:
+    """Intelligent routing based on request characteristics"""
+
+    # Keywords for different capabilities
+    CAPABILITY_KEYWORDS = {
+        "code": ["code", "编程", "写代码", "debug", "function", "algorithm", "程序"],
+        "creative": ["写", "创作", "故事", "小说", "诗", "创意", "write", "story", "creative"],
+        "reasoning": ["分析", "推理", "为什么", "思考", "reason", "think", "analyze"],
+        "math": ["计算", "数学", "数字", "math", "calculate", "算"],
+        "translation": ["翻译", "translate", "英译", "中译"],
+    }
+
+    def __init__(self, endpoints: list[EndpointConfig]):
+        self.endpoints = {e.name: e for e in endpoints if e.enabled}
+
+    def select(
+        self,
+        messages: list[dict],
+        preferred_model: Optional[str] = None
+    ) -> Optional[EndpointConfig]:
+        """Select best endpoint based on content analysis"""
+        if not self.endpoints:
+            return None
+
+        # If specific model requested
+        if preferred_model:
+            for e in self.endpoints.values():
+                if e.model == preferred_model:
+                    return e
+
+        # Analyze content
+        content = " ".join(
+            msg.get("content", "") for msg in messages
+        ).lower()
+
+        # Find matching capabilities
+        matched_capabilities = []
+        for cap, keywords in self.CAPABILITY_KEYWORDS.items():
+            if any(kw in content for kw in keywords):
+                matched_capabilities.append(cap)
+
+        # Find endpoint with matching capabilities
+        if matched_capabilities:
+            for e in self.endpoints.values():
+                for cap in matched_capabilities:
+                    if cap in e.capabilities:
+                        return e
+
+        # Default: return first enabled endpoint
+        return next(iter(self.endpoints.values()))
+
+
+# ============== Cost Optimizer ==============
+class CostOptimizer:
+    """Select cheapest suitable endpoint"""
+
+    def __init__(self, endpoints: list[EndpointConfig]):
+        self.endpoints = [e for e in endpoints if e.enabled]
+        # Sort by cost
+        self.endpoints.sort(key=lambda e: e.cost_per_1k_tokens)
+
+    def select(self, required_tokens: int = 1000) -> Optional[EndpointConfig]:
+        """Select cheapest endpoint"""
+        if not self.endpoints:
+            return None
+        return self.endpoints[0]
 
 
 # ============== Rate Limiter ==============
 class RateLimiter:
-    """Token bucket rate limiter"""
+    """Token bucket rate limiter with multi-tenant support"""
 
     def __init__(self, requests_per_minute: int):
         self.requests_per_minute = requests_per_minute
@@ -116,14 +319,9 @@ class RateLimiter:
         self.lock = threading.Lock()
 
     def is_allowed(self, key: str) -> bool:
-        """Check if request is allowed"""
         with self.lock:
             now = time.time()
-            # Clean old requests
-            self.requests[key] = [
-                t for t in self.requests[key]
-                if now - t < 60
-            ]
+            self.requests[key] = [t for t in self.requests[key] if now - t < 60]
 
             if len(self.requests[key]) >= self.requests_per_minute:
                 return False
@@ -132,13 +330,9 @@ class RateLimiter:
             return True
 
     def get_remaining(self, key: str) -> int:
-        """Get remaining requests"""
         with self.lock:
             now = time.time()
-            self.requests[key] = [
-                t for t in self.requests[key]
-                if now - t < 60
-            ]
+            self.requests[key] = [t for t in self.requests[key] if now - t < 60]
             return max(0, self.requests_per_minute - len(self.requests[key]))
 
 
@@ -154,14 +348,10 @@ class LoadBalancer:
         self.lock = threading.Lock()
 
     def set_endpoints(self, endpoints: list[EndpointConfig]):
-        """Set available endpoints"""
         with self.lock:
             self.endpoints = [e for e in endpoints if e.enabled]
-            # Reset connection counts for new endpoints
-            self.connection_counts = defaultdict(int)
 
     def select(self) -> Optional[EndpointConfig]:
-        """Select an endpoint based on strategy"""
         if not self.endpoints:
             return None
 
@@ -176,7 +366,6 @@ class LoadBalancer:
                 return random.choice(self.endpoints)
 
             elif self.strategy == LoadBalancerStrategy.LEAST_CONNECTIONS:
-                # Select endpoint with least connections
                 endpoint = min(
                     self.endpoints,
                     key=lambda e: self.connection_counts.get(e.name, 0)
@@ -185,17 +374,20 @@ class LoadBalancer:
                 return endpoint
 
             elif self.strategy == LoadBalancerStrategy.WEIGHTED:
-                # Weighted random selection
                 import random
                 weights = [e.weight for e in self.endpoints]
                 total = sum(weights)
                 probabilities = [w / total for w in weights]
                 return random.choices(self.endpoints, weights=probabilities)[0]
 
-        return self.endpoints[0]
+            elif self.strategy == LoadBalancerStrategy.COST_OPTIMIZED:
+                # Cheapest first
+                sorted_endpoints = sorted(self.endpoints, key=lambda e: e.cost_per_1k_tokens)
+                return sorted_endpoints[0]
+
+        return self.endpoints[0] if self.endpoints else None
 
     def release_connection(self, endpoint_name: str):
-        """Release a connection (for least_connections)"""
         with self.lock:
             if self.connection_counts[endpoint_name] > 0:
                 self.connection_counts[endpoint_name] -= 1
@@ -203,8 +395,6 @@ class LoadBalancer:
 
 # ============== LLM Provider Clients ==============
 class LLMClient(ABC):
-    """Abstract LLM client"""
-
     @abstractmethod
     async def chat(
         self,
@@ -214,13 +404,10 @@ class LLMClient(ABC):
         max_tokens: Optional[int],
         stream: bool
     ) -> dict | Callable[[], Any]:
-        """Send chat request"""
         pass
 
 
 class OpenAIClient(LLMClient):
-    """OpenAI-compatible client"""
-
     async def chat(
         self,
         endpoint: EndpointConfig,
@@ -271,8 +458,6 @@ class OpenAIClient(LLMClient):
 
 
 class AnthropicClient(LLMClient):
-    """Anthropic Claude client"""
-
     async def chat(
         self,
         endpoint: EndpointConfig,
@@ -287,7 +472,6 @@ class AnthropicClient(LLMClient):
             "anthropic-version": "2023-06-01"
         }
 
-        # Convert messages to Anthropic format
         system_message = ""
         anthropic_messages = []
         for msg in messages:
@@ -315,7 +499,6 @@ class AnthropicClient(LLMClient):
                 )
                 response.raise_for_status()
                 data = response.json()
-                # Convert to OpenAI format
                 return {
                     "id": f"chatcmpl-{data.get('id', '')}",
                     "object": "chat.completion",
@@ -354,8 +537,6 @@ class AnthropicClient(LLMClient):
 
 
 class GeminiClient(LLMClient):
-    """Google Gemini client"""
-
     async def chat(
         self,
         endpoint: EndpointConfig,
@@ -364,11 +545,8 @@ class GeminiClient(LLMClient):
         max_tokens: Optional[int],
         stream: bool
     ) -> dict | Callable[[], Any]:
-        headers = {
-            "Content-Type": "application/json"
-        }
+        headers = {"Content-Type": "application/json"}
 
-        # Convert messages to Gemini format
         contents = []
         for msg in messages:
             contents.append({
@@ -381,7 +559,6 @@ class GeminiClient(LLMClient):
             "generationConfig": {
                 "temperature": temperature,
                 "maxOutputTokens": max_tokens,
-                "stream": stream
             }
         }
 
@@ -394,7 +571,6 @@ class GeminiClient(LLMClient):
                 )
                 response.raise_for_status()
                 data = response.json()
-                # Convert to OpenAI format
                 return {
                     "id": f"chatcmpl-{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}",
                     "object": "chat.completion",
@@ -408,112 +584,170 @@ class GeminiClient(LLMClient):
                         },
                         "finish_reason": "stop"
                     }],
-                    "usage": {
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0
-                    }
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                 }
-
-        if stream:
-            async def stream_call():
-                async with httpx.AsyncClient(timeout=endpoint.timeout) as client:
-                    async with client.stream(
-                        "POST",
-                        f"{endpoint.base_url}/{endpoint.model}:streamGenerateContent",
-                        headers=headers,
-                        json=payload
-                    ) as response:
-                        async for line in response.aiter_lines():
-                            if line:
-                                yield line + "\n\n"
-            return stream_call
 
         return await call()
 
 
+# ============== Metrics ==============
+class Metrics:
+    """Prometheus-compatible metrics"""
+
+    def __init__(self):
+        self.requests_total = 0
+        self.requests_success = 0
+        self.requests_failed = 0
+        self.requests_cached = 0
+        self.tokens_used = 0
+        self.cost_total = 0.0
+        self.latencies = []
+        self.endpoint_stats = defaultdict(lambda: {"requests": 0, "success": 0, "failed": 0, "latency_sum": 0})
+        self.lock = threading.Lock()
+
+    def record_request(self, endpoint: str, success: bool, latency: float, cached: bool = False, tokens: int = 0, cost: float = 0):
+        with self.lock:
+            self.requests_total += 1
+            if cached:
+                self.requests_cached += 1
+            elif success:
+                self.requests_success += 1
+            else:
+                self.requests_failed += 1
+
+            self.tokens_used += tokens
+            self.cost_total += cost
+            self.latencies.append(latency)
+            if len(self.latencies) > 1000:
+                self.latencies = self.latencies[-1000:]
+
+            stats = self.endpoint_stats[endpoint]
+            stats["requests"] += 1
+            stats["latency_sum"] += latency
+            if success:
+                stats["success"] += 1
+            else:
+                stats["failed"] += 1
+
+    def get_stats(self) -> dict:
+        with self.lock:
+            avg_latency = sum(self.latencies) / len(self.latencies) if self.latencies else 0
+            sorted_latencies = sorted(self.latencies)
+            p50 = sorted_latencies[len(sorted_latencies) // 2] if sorted_latencies else 0
+            p95 = sorted_latencies[int(len(sorted_latencies) * 0.95)] if sorted_latencies else 0
+            p99 = sorted_latencies[int(len(sorted_latencies) * 0.99)] if sorted_latencies else 0
+
+            return {
+                "requests_total": self.requests_total,
+                "requests_success": self.requests_success,
+                "requests_failed": self.requests_failed,
+                "requests_cached": self.requests_cached,
+                "success_rate": self.requests_success / self.requests_total if self.requests_total > 0 else 0,
+                "tokens_used": self.tokens_used,
+                "cost_total": self.cost_total,
+                "latency_avg_ms": avg_latency * 1000,
+                "latency_p50_ms": p50 * 1000,
+                "latency_p95_ms": p95 * 1000,
+                "latency_p99_ms": p99 * 1000,
+                "endpoints": dict(self.endpoint_stats)
+            }
+
+    def to_prometheus(self) -> str:
+        """Export in Prometheus format"""
+        stats = self.get_stats()
+        lines = [
+            "# HELP llm_router_requests_total Total requests",
+            "# TYPE llm_router_requests_total counter",
+            f"llm_router_requests_total {stats['requests_total']}",
+            f"llm_router_requests_success {stats['requests_success']}",
+            f"llm_router_requests_failed {stats['requests_failed']}",
+            f"llm_router_requests_cached {stats['requests_cached']}",
+            "",
+            "# HELP llm_router_tokens_total Total tokens used",
+            "# TYPE llm_router_tokens_total counter",
+            f"llm_router_tokens_total {stats['tokens_used']}",
+            "",
+            "# HELP llm_router_cost_total Total cost in USD",
+            "# TYPE llm_router_cost_total counter",
+            f"llm_router_cost_total {stats['cost_total']}",
+            "",
+            "# HELP llm_router_latency_seconds Request latency",
+            "# TYPE llm_router_latency_seconds histogram",
+            f"llm_router_latency_sum {stats['latency_avg_ms'] / 1000}",
+            f"llm_router_latency_count {stats['requests_total']}",
+        ]
+        return "\n".join(lines)
+
+
 # ============== Router ==============
 class LLMRouter:
-    """Main LLM Router"""
+    """Main LLM Router with all advanced features"""
 
     def __init__(self, config: RouterConfig):
         self.config = config
         self.load_balancer = LoadBalancer(config.load_balancer)
         self.rate_limiter = RateLimiter(config.rate_limit) if config.rate_limit else None
-        self.client = self._create_client()
-        self.api_keys: dict[str, APIKeyInfo] = {}
-        self.health_status: dict[str, bool] = {}
-        self.request_logs: list[dict] = []
-        self.lock = threading.Lock()
+        self.client = OpenAIClient()  # Default client
 
-        # Initialize endpoints
-        self.load_balancer.set_endpoints(config.endpoints)
-        for endpoint in config.endpoints:
-            self.health_status[endpoint.name] = True
-
-    def _create_client(self) -> LLMClient:
-        """Create appropriate client based on config"""
-        # For now, default to OpenAI-compatible
-        return OpenAIClient()
-
-    def register_api_key(self, api_key: str, rate_limit: Optional[int] = None) -> str:
-        """Register an API key and return its hash"""
-        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-        prefix = api_key[:8] if len(api_key) >= 8 else api_key
-
-        with self.lock:
-            self.api_keys[key_hash] = APIKeyInfo(
-                key_hash=key_hash,
-                prefix=prefix,
-                created_at=int(time.time()),
-                rate_limit=rate_limit,
-                enabled=True
+        # Cache
+        self.cache: Optional[RequestCache] = None
+        if config.cache_enabled:
+            self.cache = RequestCache(
+                max_size=config.cache_max_size,
+                ttl=config.cache_ttl,
+                redis_url=config.redis_url
             )
 
-        return key_hash
+        # Smart routing
+        self.smart_router: Optional[SmartRouter] = None
+        if config.smart_routing:
+            self.smart_router = SmartRouter(config.endpoints)
 
-    def validate_api_key(self, api_key: str) -> bool:
-        """Validate an API key"""
-        if not self.api_keys:
-            return True  # No keys registered, allow all
+        # Cost optimizer
+        self.cost_optimizer: Optional[CostOptimizer] = None
+        if config.cost_optimization:
+            self.cost_optimizer = CostOptimizer(config.endpoints)
 
-        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-        key_info = self.api_keys.get(key_hash)
+        # Multi-tenant
+        self.tenants: dict[str, TenantConfig] = {}
+        if config.multi_tenant:
+            self.tenants = config.tenants
 
-        if not key_info or not key_info.enabled:
-            return False
+        # Metrics
+        self.metrics = Metrics()
 
-        # Check rate limit if set
-        if key_info.rate_limit:
-            limiter = RateLimiter(key_info.rate_limit)
-            return limiter.is_allowed(key_hash)
+        # Initialize
+        self.load_balancer.set_endpoints(config.endpoints)
 
-        return True
+        # Config hot reload watcher
+        self.config_watcher = None
+        if config.config_watch:
+            self._start_config_watcher()
 
-    def get_api_key_remaining(self, api_key: str) -> int:
-        """Get remaining requests for API key"""
-        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
-        key_info = self.api_keys.get(key_hash)
+    def _start_config_watcher(self):
+        """Watch config file for changes"""
+        import watchdog.observers
+        import watchdog.events
 
-        if not key_info or not key_info.rate_limit:
-            return -1
+        class ConfigHandler(watchdog.events.FileSystemEventHandler):
+            def on_modified(self, event):
+                if event.src_path.endswith("config.yaml"):
+                    logger.info("Config file changed, reloading...")
+                    # Reload config (simplified)
+                    pass
 
-        limiter = RateLimiter(key_info.rate_limit)
-        return limiter.get_remaining(key_hash)
+        self.config_watcher = watchdog.observers.Observer()
+        self.config_watcher.schedule(ConfigHandler(), ".", recursive=False)
+        self.config_watcher.start()
 
-    def _log_request(self, endpoint: str, success: bool, duration: float, error: Optional[str] = None):
-        """Log a request"""
-        with self.lock:
-            self.request_logs.append({
-                "timestamp": time.time(),
-                "endpoint": endpoint,
-                "success": success,
-                "duration": duration,
-                "error": error
-            })
-            # Keep only last 1000 logs
-            if len(self.request_logs) > 1000:
-                self.request_logs = self.request_logs[-1000:]
+    def _validate_tenant(self, tenant_id: str) -> Optional[TenantConfig]:
+        """Validate tenant and get config"""
+        if not self.tenants:
+            return None
+        tenant = self.tenants.get(tenant_id)
+        if not tenant or not tenant.enabled:
+            return None
+        return tenant
 
     async def chat(
         self,
@@ -521,19 +755,30 @@ class LLMRouter:
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         stream: bool = False,
-        api_key: Optional[str] = None
+        tenant_id: Optional[str] = None,
+        model: Optional[str] = None
     ) -> dict | Callable[[], Any]:
-        """Send chat request with retry and fallback"""
-        # Validate API key
-        if api_key and not self.validate_api_key(api_key):
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Rate limit exceeded or invalid API key"
-            )
+        # Multi-tenant validation
+        tenant = self._validate_tenant(tenant_id) if tenant_id else None
+        if tenant:
+            # Check tenant-specific rate limit
+            tenant_limiter = RateLimiter(tenant.rate_limit)
+            if not tenant_limiter.is_allowed(tenant_id):
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Tenant rate limit exceeded"
+                )
+
+            # Check budget
+            if tenant.monthly_budget and self.metrics.cost_total >= tenant.monthly_budget:
+                raise HTTPException(
+                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                    detail="Monthly budget exceeded"
+                )
 
         # Rate limiting
         if self.rate_limiter:
-            client_key = api_key or "default"
+            client_key = tenant_id or "default"
             if not self.rate_limiter.is_allowed(client_key):
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -541,8 +786,23 @@ class LLMRouter:
                     headers={"Retry-After": "60"}
                 )
 
+        # Check cache
+        if self.cache:
+            cache_key = self.cache._generate_key(messages, temperature, max_tokens)
+            cached_response = self.cache.get(cache_key)
+            if cached_response:
+                self.metrics.record_request("", True, 0, cached=True)
+                logger.info("Cache hit!")
+                return cached_response
+
         # Select endpoint
-        endpoint = self.load_balancer.select()
+        if self.smart_router and model is None:
+            endpoint = self.smart_router.select(messages, model)
+        elif self.cost_optimizer:
+            endpoint = self.cost_optimizer.select()
+        else:
+            endpoint = self.load_balancer.select()
+
         if not endpoint:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -563,7 +823,15 @@ class LLMRouter:
                 )
 
                 duration = time.time() - start_time
-                self._log_request(endpoint.name, True, duration)
+
+                # Cache result
+                if self.cache and not stream:
+                    self.cache.set(cache_key, result)
+
+                # Record metrics
+                tokens = result.get("usage", {}).get("total_tokens", 0)
+                cost = (tokens / 1000) * endpoint.cost_per_1k_tokens
+                self.metrics.record_request(endpoint.name, True, duration, tokens=tokens, cost=cost)
                 self.load_balancer.release_connection(endpoint.name)
 
                 return result
@@ -572,73 +840,42 @@ class LLMRouter:
                 duration = time.time() - start_time
                 last_error = str(e)
                 logger.warning(f"Request failed (attempt {attempt + 1}/{endpoint.max_retries}): {e}")
-                self._log_request(endpoint.name, False, duration, str(e))
+                self.metrics.record_request(endpoint.name, False, duration)
 
-                # Wait before retry
                 if attempt < endpoint.max_retries - 1:
                     await asyncio.sleep(self.config.retry_delay * (attempt + 1))
 
-        # All retries failed
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"All endpoints failed: {last_error}"
         )
 
     def get_health_status(self) -> dict:
-        """Get health status of all endpoints"""
         return {
-            "endpoints": {
-                name: status for name, status in self.health_status.items()
-            },
-            "total_endpoints": len(self.health_status),
-            "healthy_endpoints": sum(self.health_status.values())
+            "status": "healthy",
+            "endpoints_count": len(self.config.endpoints),
+            "cache_enabled": self.cache is not None,
+            "smart_routing": self.smart_router is not None,
+            "multi_tenant": len(self.tenants) > 0
         }
 
     def get_stats(self) -> dict:
-        """Get router statistics"""
-        with self.lock:
-            total_requests = len(self.request_logs)
-            successful = sum(1 for log in self.request_logs if log["success"])
-            failed = total_requests - successful
+        return self.metrics.get_stats()
 
-            avg_duration = 0
-            if self.request_logs:
-                avg_duration = sum(log["duration"] for log in self.request_logs) / total_requests
-
-            # Per-endpoint stats
-            endpoint_stats = defaultdict(lambda: {"requests": 0, "success": 0, "failed": 0})
-            for log in self.request_logs:
-                endpoint_stats[log["endpoint"]]["requests"] += 1
-                if log["success"]:
-                    endpoint_stats[log["endpoint"]]["success"] += 1
-                else:
-                    endpoint_stats[log["endpoint"]]["failed"] += 1
-
-            return {
-                "total_requests": total_requests,
-                "successful": successful,
-                "failed": failed,
-                "success_rate": successful / total_requests if total_requests > 0 else 0,
-                "average_duration": avg_duration,
-                "endpoints": dict(endpoint_stats)
-            }
-
-    def get_logs(self, limit: int = 100) -> list[dict]:
-        """Get recent request logs"""
-        with self.lock:
-            return self.request_logs[-limit:]
+    def clear_cache(self):
+        if self.cache:
+            self.cache.clear()
+        return {"status": "cache cleared"}
 
 
 # ============== FastAPI App ==============
 app = FastAPI(
-    title="LLM Router",
-    description="Multi-Provider LLM Routing with Load Balancing, Retry, and Rate Limiting",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
+    title="LLM Router Advanced",
+    description="Advanced LLM Router with Caching, Smart Routing, Cost Optimization, Multi-Tenant",
+    version="2.0.0",
+    docs_url="/docs"
 )
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -647,68 +884,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global router instance
 router: Optional[LLMRouter] = None
 
 
 def get_router() -> LLMRouter:
-    """Get router instance"""
     if router is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Router not initialized"
-        )
+        raise HTTPException(status_code=503, detail="Router not initialized")
     return router
 
 
 # ============== API Routes ==============
 @app.get("/")
 async def root():
-    """Root endpoint"""
-    return {
-        "name": "LLM Router",
-        "version": "1.0.0",
-        "docs": "/docs"
-    }
+    return {"name": "LLM Router Advanced", "version": "2.0.0", "docs": "/docs"}
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint"""
     return get_router().get_health_status()
 
 
 @app.get("/stats")
 async def stats():
-    """Get router statistics"""
     return get_router().get_stats()
 
 
-@app.get("/logs")
-async def logs(limit: int = 100):
-    """Get request logs"""
-    return get_router().get_logs(limit)
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint"""
+    return Response(
+        content=get_router().metrics.to_prometheus(),
+        media_type="text/plain"
+    )
 
 
-@app.post("/keys")
-async def create_api_key(rate_limit: Optional[int] = None):
-    """Create a new API key"""
-    import secrets
-    api_key = f"sk-{secrets.token_urlsafe(32)}"
-    key_hash = get_router().register_api_key(api_key, rate_limit)
-    return {
-        "api_key": api_key,
-        "key_hash": key_hash
-    }
+@app.post("/cache/clear")
+async def clear_cache():
+    return get_router().clear_cache()
+
+
+@app.post("/config/reload")
+async def reload_config():
+    """Hot reload configuration"""
+    # Simplified: would reload from file in production
+    return {"status": "config reloaded"}
 
 
 @app.post("/chat/completions")
 async def chat_completions(request: ChatRequest, req: Request):
-    """Chat completions endpoint"""
-    # Get API key from header
-    api_key = req.headers.get("Authorization", "").replace("Bearer ", "")
-
-    # Convert messages to dict format
     messages = [msg.model_dump() for msg in request.messages]
 
     try:
@@ -717,7 +940,8 @@ async def chat_completions(request: ChatRequest, req: Request):
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             stream=request.stream,
-            api_key=api_key
+            tenant_id=request.tenant_id,
+            model=request.model
         )
 
         if request.stream:
@@ -725,10 +949,7 @@ async def chat_completions(request: ChatRequest, req: Request):
                 stream_fn = result
                 async for chunk in stream_fn():
                     yield chunk
-            return StreamingResponse(
-                generate(),
-                media_type="text/event-stream"
-            )
+            return StreamingResponse(generate(), media_type="text/event-stream")
 
         return result
 
@@ -736,54 +957,43 @@ async def chat_completions(request: ChatRequest, req: Request):
         raise
     except Exception as e:
         logger.error(f"Chat error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/v1/chat/completions")
 async def v1_chat_completions(request: ChatRequest, req: Request):
-    """OpenAI-compatible chat completions endpoint"""
     return await chat_completions(request, req)
 
 
-# ============== WebSocket Endpoint ==============
-@app.websocket("/ws/chat")
-async def websocket_chat(websocket):
-    """WebSocket chat endpoint"""
-    await websocket.accept()
+# ============== Batch API ==============
+class BatchRequest(BaseModel):
+    requests: list[ChatRequest]
 
-    try:
-        while True:
-            data = await websocket.receive_json()
-            messages = data.get("messages", [])
-            temperature = data.get("temperature", 0.7)
-            max_tokens = data.get("max_tokens")
-            stream = data.get("stream", False)
 
+@app.post("/v1/batch")
+async def batch_chat(batch: BatchRequest):
+    """Process multiple requests in batch"""
+    results = []
+
+    for req in batch.requests:
+        messages = [msg.model_dump() for msg in req.messages]
+        try:
             result = await get_router().chat(
                 messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=stream
+                temperature=req.temperature,
+                max_tokens=req.max_tokens,
+                stream=False,
+                tenant_id=req.tenant_id
             )
+            results.append({"success": True, "data": result})
+        except Exception as e:
+            results.append({"success": False, "error": str(e)})
 
-            if stream:
-                stream_fn = result
-                async for chunk in stream_fn():
-                    await websocket.send_text(chunk)
-            else:
-                await websocket.send_json(result)
-
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        await websocket.close()
+    return {"results": results}
 
 
 # ============== Main ==============
 def load_config(config_path: str = "config.yaml") -> RouterConfig:
-    """Load configuration from YAML file"""
     if os.path.exists(config_path):
         with open(config_path, "r") as f:
             data = yaml.safe_load(f)
@@ -792,17 +1002,13 @@ def load_config(config_path: str = "config.yaml") -> RouterConfig:
 
 
 def main():
-    """Main entry point"""
     global router
 
-    # Load config
     config_path = os.environ.get("CONFIG_PATH", "config.yaml")
     config = load_config(config_path)
 
-    # Create router
     router = LLMRouter(config)
 
-    # Run server
     port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
 

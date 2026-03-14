@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Router Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+        }
+        .header {
+            background: #1e293b;
+            padding: 1rem 2rem;
+            border-bottom: 1px solid #334155;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .header h1 { font-size: 1.5rem; color: #38bdf8; }
+        .status-badge {
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.875rem;
+            background: #22c55e;
+            color: white;
+        }
+        .status-badge.error { background: #ef4444; }
+        .container { padding: 2rem; max-width: 1400px; margin: 0 auto; }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        .card {
+            background: #1e293b;
+            border-radius: 0.75rem;
+            padding: 1.5rem;
+            border: 1px solid #334155;
+        }
+        .card h3 { font-size: 0.875rem; color: #94a3b8; margin-bottom: 0.5rem; }
+        .card .value { font-size: 2rem; font-weight: bold; color: #38bdf8; }
+        .card .value.success { color: #22c55e; }
+        .card .value.error { color: #ef4444; }
+        .card .value.warning { color: #f59e0b; }
+        .charts { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1.5rem; margin-bottom: 2rem; }
+        .chart-card { background: #1e293b; border-radius: 0.75rem; padding: 1.5rem; border: 1px solid #334155; }
+        .chart-card h3 { margin-bottom: 1rem; color: #94a3b8; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 0.75rem; text-align: left; border-bottom: 1px solid #334155; }
+        th { color: #94a3b8; font-weight: 500; font-size: 0.875rem; }
+        .refresh-btn {
+            background: #38bdf8;
+            color: #0f172a;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        .refresh-btn:hover { background: #0ea5e9; }
+        .endpoint-list { max-height: 300px; overflow-y: auto; }
+        .endpoint-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem;
+            border-bottom: 1px solid #334155;
+        }
+        .endpoint-item:last-child { border-bottom: none; }
+        .endpoint-status {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #22c55e;
+        }
+        .endpoint-status.down { background: #ef4444; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🧭 LLM Router Dashboard</h1>
+        <div>
+            <span id="healthStatus" class="status-badge">Healthy</span>
+            <button class="refresh-btn" onclick="refresh()">↻ Refresh</button>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="grid">
+            <div class="card">
+                <h3>Total Requests</h3>
+                <div class="value" id="totalRequests">-</div>
+            </div>
+            <div class="card">
+                <h3>Success Rate</h3>
+                <div class="value success" id="successRate">-</div>
+            </div>
+            <div class="card">
+                <h3>Cache Hits</h3>
+                <div class="value" id="cacheHits">-</div>
+            </div>
+            <div class="card">
+                <h3>Total Cost</h3>
+                <div class="value warning" id="totalCost">-</div>
+            </div>
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <h3>Avg Latency</h3>
+                <div class="value" id="avgLatency">-</div>
+            </div>
+            <div class="card">
+                <h3>P95 Latency</h3>
+                <div class="value" id="p95Latency">-</div>
+            </div>
+            <div class="card">
+                <h3>Tokens Used</h3>
+                <div class="value" id="tokensUsed">-</div>
+            </div>
+            <div class="card">
+                <h3>Active Endpoints</h3>
+                <div class="value" id="endpointCount">-</div>
+            </div>
+        </div>
+
+        <div class="charts">
+            <div class="chart-card">
+                <h3>Request Success/Failed</h3>
+                <canvas id="successChart"></canvas>
+            </div>
+            <div class="chart-card">
+                <h3>Latency Distribution (ms)</h3>
+                <canvas id="latencyChart"></canvas>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Endpoint Status</h3>
+            <div class="endpoint-list" id="endpoints">
+                <div class="endpoint-item">
+                    <span>Loading...</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let successChart, latencyChart;
+
+        async function fetchStats() {
+            try {
+                const res = await fetch('/stats');
+                return await res.json();
+            } catch (e) {
+                console.error(e);
+                return null;
+            }
+        }
+
+        async function fetchHealth() {
+            try {
+                const res = await fetch('/health');
+                return await res.json();
+            } catch (e) {
+                return null;
+            }
+        }
+
+        async function refresh() {
+            const stats = await fetchStats();
+            const health = await fetchHealth();
+
+            if (!stats) {
+                document.getElementById('healthStatus').textContent = 'Error';
+                document.getElementById('healthStatus').classList.add('error');
+                return;
+            }
+
+            // Update cards
+            document.getElementById('totalRequests').textContent = stats.requests_total.toLocaleString();
+            document.getElementById('successRate').textContent = (stats.success_rate * 100).toFixed(1) + '%';
+            document.getElementById('cacheHits').textContent = stats.requests_cached.toLocaleString();
+            document.getElementById('totalCost').textContent = '$' + stats.cost_total.toFixed(4);
+            document.getElementById('avgLatency').textContent = stats.latency_avg_ms.toFixed(0) + 'ms';
+            document.getElementById('p95Latency').textContent = stats.latency_p95_ms.toFixed(0) + 'ms';
+            document.getElementById('tokensUsed').textContent = stats.tokens_used.toLocaleString();
+            document.getElementById('endpointCount').textContent = health?.endpoints_count || 0;
+
+            // Update health status
+            const statusEl = document.getElementById('healthStatus');
+            if (health?.status === 'healthy') {
+                statusEl.textContent = 'Healthy';
+                statusEl.classList.remove('error');
+            } else {
+                statusEl.textContent = 'Error';
+                statusEl.classList.add('error');
+            }
+
+            // Update endpoint list
+            const endpointsEl = document.getElementById('endpoints');
+            if (stats.endpoints) {
+                endpointsEl.innerHTML = Object.entries(stats.endpoints).map(([name, data]) => `
+                    <div class="endpoint-item">
+                        <div style="display: flex; align-items: center; gap: 0.5rem;">
+                            <div class="endpoint-status ${data.failed > data.success ? 'down' : ''}"></div>
+                            <span>${name}</span>
+                        </div>
+                        <span>${data.requests} requests</span>
+                    </div>
+                `).join('');
+            }
+
+            // Update charts
+            updateCharts(stats);
+        }
+
+        function updateCharts(stats) {
+            // Success chart
+            const successCtx = document.getElementById('successChart').getContext('2d');
+            if (successChart) successChart.destroy();
+            successChart = new Chart(successCtx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['Success', 'Failed', 'Cached'],
+                    datasets: [{
+                        data: [stats.requests_success, stats.requests_failed, stats.requests_cached],
+                        backgroundColor: ['#22c55e', '#ef4444', '#38bdf8']
+                    }]
+                },
+                options: { responsive: true, plugins: { legend: { position: 'bottom' } } }
+            });
+
+            // Latency chart
+            const latencyCtx = document.getElementById('latencyChart').getContext('2d');
+            if (latencyChart) latencyChart.destroy();
+            latencyChart = new Chart(latencyCtx, {
+                type: 'bar',
+                data: {
+                    labels: ['Avg', 'P50', 'P95', 'P99'],
+                    datasets: [{
+                        label: 'Latency (ms)',
+                        data: [stats.latency_avg_ms, stats.latency_p50_ms, stats.latency_p95_ms, stats.latency_p99_ms],
+                        backgroundColor: '#38bdf8'
+                    }]
+                },
+                options: { responsive: true, plugins: { legend: { display: false } } }
+            });
+        }
+
+        // Auto refresh every 10 seconds
+        refresh();
+        setInterval(refresh, 10000);
+    </script>
+</body>
+</html>

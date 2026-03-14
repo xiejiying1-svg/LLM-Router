@@ -1,119 +1,100 @@
-# LLM Router 配置示例
-# 复制此文件为 config.yaml 并填入你的 API Keys
+# Example configuration for LLM Router Advanced
 
-server:
-  host: "0.0.0.0"
-  port: 8000
+load_balancer: smart  # round_robin, random, least_connections, weighted, cost_optimized, smart
+default_timeout: 60
+max_retries: 3
+retry_delay: 1.0
 
-providers:
-  # OpenAI 配置
-  openai:
+# Advanced features
+cache_enabled: true
+cache_ttl: 3600  # 1 hour
+cache_max_size: 1000
+redis_url: redis://localhost:6379  # Optional: for distributed cache
+
+smart_routing: true  # Auto-select model based on content
+cost_optimization: true  # Auto-select cheapest model
+
+# Multi-tenant
+multi_tenant: true
+tenants:
+  default:
+    tenant_id: default
+    rate_limit: 60
+    monthly_budget: 100.0
+    endpoints: []
     enabled: true
-    api_key: ""
-    base_url: "https://api.openai.com/v1"
-    models:
-      - gpt-4o
-      - gpt-4o-mini
-      - gpt-4-turbo
-      - gpt-3.5-turbo
-  
-  # Anthropic (Claude) 配置
-  anthropic:
-    enabled: false
-    api_key: ""
-    models:
-      - claude-sonnet-4-20250514
-      - claude-3-opus-20240229
-      - claude-3-haiku-20240307
-  
-  # DeepSeek 配置
-  deepseek:
-    enabled: false
-    api_key: ""
-    base_url: "https://api.deepseek.com"
-    models:
-      - deepseek-chat
-  
-  # Moonshot (Kimi) 配置
-  moonshot:
-    enabled: false
-    api_key: ""
-    base_url: "https://api.moonshot.cn/v1"
-    models:
-      - moonshot-v1-8k
-      - moonshot-v1-32k
-  
-  # 智谱 (GLM) 配置
-  zhipu:
-    enabled: false
-    api_key: ""
-    base_url: "https://open.bigmodel.cn/api/paas/v4"
-    models:
-      - glm-4
-      - glm-4-flash
-      - glm-4-plus
-  
-  # SiliconFlow 配置
-  siliconflow:
-    enabled: false
-    api_key: ""
-    base_url: "https://api.siliconflow.cn/v1"
-    models:
-      - Qwen/Qwen2-7B-Instruct
-      - THUDM/glm-4-9b-chat
-  
-  # OpenRouter 配置
-  openrouter:
-    enabled: false
-    api_key: ""
-    base_url: "https://openrouter.ai/api/v1"
-    models:
-      - anthropic/claude-3-haiku
-      - google/gemini-pro
+  premium:
+    tenant_id: premium
+    rate_limit: 200
+    monthly_budget: 500.0
+    endpoints: []
+    enabled: true
 
-routing:
-  # 默认模型
-  default_model: "gpt-4o-mini"
-  
-  # 备用模型列表（按优先级排序）
-  fallback_models:
-    - gpt-4o-mini
-    - deepseek-chat
-    - glm-4-flash
-  
-  # 路由策略: fastest | cheapest | quality | balanced
-  strategy: "balanced"
-  
-  # 请求超时（秒）
-  timeout: 60
-  
-  # 最大重试次数
-  max_retries: 3
+# Hot reload config file
+config_watch: false
 
-monitoring:
-  enabled: true
-  log_file: "router.log"
-  
-  # 统计
-  stats_interval: 60  # 秒
-  
-  # 告警阈值
-  alerts:
-    error_rate_threshold: 0.1  # 10% 错误率告警
-    latency_threshold: 30  # 30秒延迟告警
-    quota_threshold: 0.2  # 20% 余额告警
+# Rate limiting (global)
+rate_limit: 100  # requests per minute
 
-# 成本配置（单位：美元/1M tokens）
-costs:
-  gpt-4o-mini:
-    input: 0.15
-    output: 0.6
-  gpt-4o:
-    input: 2.5
-    output: 10
-  deepseek-chat:
-    input: 0.14
-    output: 0.28
-  glm-4-flash:
-    input: 0.1
-    output: 0.1
+# Health check
+health_check_interval: 60
+
+# Endpoints
+endpoints:
+  - name: openai-gpt4
+    provider: openai
+    base_url: ${OPENAI_BASE_URL}
+    api_key: ${OPENAI_API_KEY}
+    model: gpt-4
+    weight: 1
+    timeout: 60
+    max_retries: 3
+    enabled: true
+    cost_per_1k_tokens: 0.03
+    capabilities:
+      - reasoning
+      - creative
+    max_tokens: 8192
+
+  - name: openai-gpt35
+    provider: openai
+    base_url: ${OPENAI_BASE_URL}
+    api_key: ${OPENAI_API_KEY}
+    model: gpt-3.5-turbo
+    weight: 2
+    timeout: 30
+    max_retries: 3
+    enabled: true
+    cost_per_1k_tokens: 0.002
+    capabilities:
+      - creative
+    max_tokens: 4096
+
+  - name: anthropic-claude
+    provider: anthropic
+    base_url: https://api.anthropic.com/v1
+    api_key: ${ANTHROPIC_API_KEY}
+    model: claude-3-opus-20240229
+    weight: 1
+    timeout: 60
+    max_retries: 3
+    enabled: true
+    cost_per_1k_tokens: 0.015
+    capabilities:
+      - reasoning
+      - code
+    max_tokens: 4096
+
+  - name: gemini-pro
+    provider: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta/models
+    api_key: ${GEMINI_API_KEY}
+    model: gemini-pro
+    weight: 1
+    timeout: 30
+    max_retries: 3
+    enabled: true
+    cost_per_1k_tokens: 0.001
+    capabilities:
+      - creative
+    max_tokens: 8192
